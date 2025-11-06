@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>מסיבת הברכות של יאיר - בר מצווה/יום הולדת</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;700&display=swap');
+        body {
+            font-family: 'Heebo', sans-serif;
+            background-color: #f0f4f8; /* Soft blue-gray background */
+            color: #1e293b;
+        }
+        /* Custom scrollbar for better look */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #94a3b8;
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #e2e8f0;
+        }
+        .tab-button {
+            transition: all 0.3s ease;
+            cursor: pointer;
+            border-bottom: 3px solid transparent;
+            padding-bottom: 8px;
+        }
+        .tab-button.active {
+            border-bottom-color: #f59e0b; /* Amber for celebration */
+            color: #f59e0b;
+            font-weight: 700;
+        }
+        .card {
+            background-color: white;
+            border-radius: 1rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            padding: 1.5rem;
+        }
+        .loading-ring {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #f59e0b;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .ai-output {
+            white-space: pre-wrap;
+            line-height: 1.6;
+            text-align: right;
+        }
+        .greeting-item {
+            border: 1px solid #cbd5e1;
+            transition: transform 0.2s;
+        }
+        .greeting-item:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+
+    <!-- Firebase SDK Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, arrayUnion, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // --- GLOBAL FIREBASE/AUTH SETUP ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Set Firebase logging level to debug for troubleshooting permission issues
+        setLogLevel('debug'); 
+
+        let db, auth, userId;
+        let isAuthReady = false;
+        let isListenerSetup = false; // Flag to ensure onSnapshot is called only once
+        let initialSignInAttempted = false; // Flag to prevent repeated sign-in calls
+
+        const app = initializeApp(firebaseConfig);
+        db = getFirestore(app);
+        auth = getAuth(app);
+        
+        // Helper function for Firestore path
+        const getGreetingsCollectionRef = () => {
+            return collection(db, 'artifacts', appId, 'public', 'data', 'greetings');
+        };
+
+        /**
+         * Function to handle initial sign-in: Tries custom token, falls back to anonymous.
+         */
+        const initialSignIn = async () => {
+            if (initialSignInAttempted) return;
+            initialSignInAttempted = true;
+            
+            if (initialAuthToken) {
+                try {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                    return; // Wait for onAuthStateChanged to handle success
+                } catch (error) {
+                    console.warn("Custom token sign in failed, falling back to anonymous:", error);
+                    // Fall through to anonymous sign-in
+                }
+            }
+
+            try {
+                await signInAnonymously(auth);
+                // Wait for onAuthStateChanged to handle success
+            } catch (error) {
+                console.error("Anonymous sign in failed:", error);
+                userId = crypto.randomUUID(); // Fallback ID for display
+                isAuthReady = true;
+            }
+        }
+
+
+        // 1. Authentication and Initialization Listener
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                userId = user.uid;
+                isAuthReady = true;
+                document.getElementById('user-id-display').textContent = `מזהה משתמש: ${userId}`;
+                console.log("Firebase initialized. User ID:", userId);
+
+                // Start listening ONLY if it hasn't started yet and we have a user
+                if (db && !isListenerSetup) {
+                    setupGreetingListener();
+                    isListenerSetup = true;
+                }
+            } else if (!auth.currentUser && !initialSignInAttempted) {
+                // If the user is null and we haven't tried to sign in yet, start the process.
+                 initialSignIn();
+            }
+            // If user is null and initialSignInAttempted is true, sign-in is pending/failed.
+        });
+
+        // Trigger the initial sign-in attempt
+        initialSignIn();
+
+        // --- AI API CALL HANDLERS ---
+        
+        /**
+         * Retries a fetch request using exponential backoff.
+         * @param {string} url - The URL to fetch.
+         * @param {object} options - Fetch options.
+         * @param {number} retries - Number of retries left.
+         * @returns {Promise<Response>}
+         */
+        const fetchWithBackoff = async (url, options, retries = 5) => {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.status !== 429 && response.ok) {
+                        return response;
+                    }
+                    if (response.status === 429 && i < retries - 1) {
+                         const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                         await new Promise(resolve => setTimeout(resolve, delay));
+                         continue;
+                    }
+                    if (!response.ok) {
+                         const errorBody = await response.text();
+                         throw new Error(`API call failed with status ${response.status}: ${errorBody}`);
+                    }
+                } catch (error) {
+                    if (i === retries - 1) throw error;
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+            throw new Error("API call failed after multiple retries.");
+        };
+
+        /**
+         * Generates text using Gemini model (for greetings).
+         * @param {string} prompt - The user prompt.
+         * @returns {Promise<string>} - The generated text.
+         */
+        window.generateAiGreeting = async (prompt) => {
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+            // Updated system prompt for a more celebratory, Israeli context
+            const systemPrompt = "אתה אשף כתיבת ברכות אישיות, חמות ומרגשות, במיוחד לאירועי בר מצווה ויום הולדת. כתוב ברכה יצירתית, כנה, ומושלמת לאירוע המבוקש. ענה רק עם נוסח הברכה עצמו, ללא הקדמות או כותרות נוספות.";
+            
+            const payload = {
+                contents: [{ parts: [{ text: prompt }] }],
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+                config: {
+                    // Reduce verbosity
+                    maxOutputTokens: 250
+                }
+            };
+            
+            try {
+                const response = await fetchWithBackoff(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "שגיאה: לא הצלחתי לייצר ברכה. נסה שוב.";
+                return text;
+
+            } catch (error) {
+                console.error("Gemini API Error:", error);
+                return `שגיאה בחיבור לבינה המלאכותית: ${error.message}. נסה שוב.`;
+            }
+        };
+
+        /**
+         * Generates song lyrics using Gemini model (for Yair).
+         * @param {string} keywords - User provided keywords/memories.
+         * @returns {Promise<string>} - The generated song lyrics.
+         */
+        window.generateAiSong = async (keywords) => {
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+            const systemPrompt = "אתה פזמונאי ישראלי מקצועי לשירי אירועים, במיוחד לבר מצווה ויום הולדת. משימתך היא לכתוב שיר אישי ומרגש ליאיר, תוך שילוב של מילות המפתח שהמשתמש סיפק. השיר צריך לכלול 2-3 בתים, פזמון (Chorus) וצריך להיות כתוב בחרוזים קליטים המתאימים למנגינה מוכרת (רצוי קצבית וחגיגית). ענה רק עם מילות השיר, כולל כותרות 'בית 1', 'פזמון', וכו'.";
+            
+            const userPrompt = `מילות המפתח שצריך לשלב בשיר ליאיר: ${keywords}. האירוע הוא בר מצווה/יום הולדת.`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userPrompt }] }],
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+                config: {
+                    // Give more tokens for a full song structure
+                    maxOutputTokens: 400
+                }
+            };
+            
+            try {
+                const response = await fetchWithBackoff(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "שגיאה: לא הצלחתי לייצר שיר. נסה שוב.";
+                return text;
+
+            } catch (error) {
+                console.error("Gemini API Song Error:", error);
+                return `שגיאה בחיבור לבינה המלאכותית: ${error.message}. נסה שוב.`;
+            }
+        };
+
+        /**
+         * Generates a "prophecy" about Yair's life at age 39.
+         */
+        window.generateTimeMachineProphecy = async (details) => {
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+            const systemPrompt = "אתה אסטרולוג, יועץ עתיד וסופר מדע בדיוני. משימתך היא לכתוב 'נבואה' או 'חזון' מפורט על חייו של יאיר ביום הולדתו ה-39, בהתבסס על הפרטים הנוכחיים שהוא מסר. הנבואה צריכה להיות אופטימית, יצירתית ומדויקת ככל האפשר לאור הנתונים. כתוב בטון מסתורי, חם ומעורר השראה, ללא כותרות נוספות מלבד הנבואה עצמה.";
+
+            const userPrompt = `כתוב נבואה על יאיר בן ה-39. הפרטים הנוכחיים, החלומות והשאיפות שלו הם: ${details}. הנבואה צריכה לכסות נושאים כמו קריירה, משפחה, תחביבים והישגים גדולים.`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userPrompt }] }],
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+                config: {
+                    maxOutputTokens: 500 // Give plenty of room for a detailed vision
+                }
+            };
+            
+            try {
+                const response = await fetchWithBackoff(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "שגיאה: לא הצלחתי לייצר נבואה. נסה שוב.";
+                return text;
+
+            } catch (error) {
+                console.error("Gemini API Time Machine Error:", error);
+                return `שגיאה בחיבור לבינה המלאכותית: ${error.message}. נסה שוב.`;
+            }
+        };
+
+
+        /**
+         * Generates an image from a prompt using Imagen. (Dream Machine)
+         * @param {string} prompt - The image prompt (memory description).
+         * @returns {Promise<string>} - Base64 data URL of the image.
+         */
+        window.generateAiImage = async (prompt) => {
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key=${apiKey}`;
+            
+            // Adjust prompt for a more celebratory or nostalgic look
+            const fullPrompt = `Create a detailed, high-quality, and evocative artistic image representing the following personal memory, dream, or wish. Use a cinematic and nostalgic style. Description: "${prompt}"`;
+            
+            const payload = {
+                instances: [{ prompt: fullPrompt }],
+                parameters: {
+                    "sampleCount": 1,
+                    "aspectRatio": "1:1" 
+                }
+            };
+
+            try {
+                const response = await fetchWithBackoff(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                const result = await response.json();
+                
+                if (result.predictions && result.predictions.length > 0 && result.predictions[0].bytesBase64Encoded) {
+                    return `data:image/png;base64,${result.predictions[0].bytesBase64Encoded}`;
+                } else {
+                    console.error("Imagen API Error:", result);
+                    return null;
+                }
+            } catch (error) {
+                console.error("Imagen API Error:", error);
+                return null;
+            }
+        };
+
+
+        // --- FIREBASE DATA MANAGEMENT (GREETINGS WALL) ---
+        
+        /**
+         * Sets up the real-time listener for the greetings wall.
+         */
+        const setupGreetingListener = () => {
+            const greetingsRef = getGreetingsCollectionRef();
+            const greetingsListElement = document.getElementById('greetings-list');
+
+            onSnapshot(greetingsRef, (snapshot) => {
+                const greetings = [];
+                snapshot.forEach(doc => {
+                    const data = doc.data();
+                    greetings.push({
+                        id: doc.id,
+                        ...data,
+                        timestamp: data.timestamp ? data.timestamp.toDate() : new Date(),
+                    });
+                });
+                
+                // Sort by timestamp (newest first)
+                greetings.sort((a, b) => b.timestamp - a.timestamp);
+                
+                renderGreetings(greetings, greetingsListElement);
+            }, (error) => {
+                console.error("Error listening to Firestore:", error);
+                greetingsListElement.innerHTML = `<div class="text-red-600 text-center p-4">שגיאה בטעינת הברכות: ${error.message}</div>`;
+            });
+        };
+
+        /**
+         * Renders the list of greetings and responses.
+         * @param {Array<Object>} greetings - Array of greeting objects.
+         * @param {HTMLElement} container - The DOM element to render into.
+         */
+        const renderGreetings = (greetings, container) => {
+            container.innerHTML = ''; // Clear existing list
+            
+            if (greetings.length === 0) {
+                container.innerHTML = `<div class="text-gray-500 text-center p-8 text-lg">אין עדיין ברכות בקיר. הוסף את הברכה הראשונה!</div>`;
+                return;
+            }
+
+            greetings.forEach(greeting => {
+                const itemDiv = document.createElement('div');
+                itemDiv.className = 'greeting-item card mb-6 border-2 border-yellow-200';
+                
+                const timestampStr = greeting.timestamp.toLocaleDateString('he-IL', {
+                    year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'
+                });
+
+                // Convert comments array to HTML
+                const responsesHtml = (greeting.responses || []).map(response => `
+                    <div class="bg-yellow-50/50 p-2 rounded-lg mt-2 text-sm border border-yellow-100">
+                        <span class="font-bold text-yellow-700 break-words">${response.userId.substring(0, 8)}...</span>: 
+                        <span class="break-words">${response.text}</span>
+                    </div>
+                `).join('');
+
+                itemDiv.innerHTML = `
+                    <div class="flex justify-between items-start mb-3 border-b pb-2 border-yellow-200">
+                        <div>
+                             <h3 class="text-xl font-bold text-gray-800">${greeting.title}</h3>
+                             <p class="text-sm text-gray-500">נשלח על ידי: <span class="font-mono">${greeting.userId.substring(0, 8)}...</span></p>
+                        </div>
+                        <span class="text-xs text-gray-400 mt-1">${timestampStr}</span>
+                    </div>
+                    
+                    <p class="text-gray-700 whitespace-pre-wrap mb-4">${greeting.content}</p>
+
+                    <div class="responses-section mt-4 pt-3 border-t border-gray-100">
+                        <h4 class="font-semibold text-gray-600 mb-2">תגובות (${(greeting.responses || []).length}):</h4>
+                        <div class="responses-list mb-3 max-h-40 overflow-y-auto">${responsesHtml}</div>
+                        
+                        <form data-greeting-id="${greeting.id}" class="response-form flex mt-3">
+                            <input type="text" name="responseText" placeholder="הוסף תגובה..." required 
+                                class="flex-grow p-2 border border-gray-300 rounded-r-lg focus:ring-yellow-500 focus:border-yellow-500">
+                            <button type="submit" class="bg-yellow-600 text-white p-2 rounded-l-lg hover:bg-yellow-700 transition duration-150">שלח</button>
+                        </form>
+                    </div>
+                `;
+                
+                // Add event listener for the response form
+                const responseForm = itemDiv.querySelector('.response-form');
+                responseForm.addEventListener('submit', handleResponseSubmit);
+
+                container.appendChild(itemDiv);
+            });
+        };
+
+        /**
+         * Handles the submission of a new greeting.
+         */
+        window.handleNewGreetingSubmit = async (event) => {
+            event.preventDefault();
+            if (!isAuthReady) {
+                showModal('האימות עדיין בתהליך, אנא המתן שניה.');
+                return;
+            }
+            
+            const form = event.target;
+            const title = form.elements.greetingTitle.value.trim();
+            const content = form.elements.greetingContent.value.trim();
+            const submitButton = form.querySelector('button[type="submit"]');
+
+            if (!title || !content) return;
+
+            submitButton.disabled = true;
+            submitButton.textContent = 'שולח...';
+
+            try {
+                await addDoc(getGreetingsCollectionRef(), {
+                    userId: userId,
+                    title: title,
+                    content: content,
+                    timestamp: new Date(),
+                    responses: [] // Initialize an empty array for responses
+                });
+                
+                form.reset();
+                showModal('הברכה נשלחה בהצלחה לקיר!');
+
+            } catch (error) {
+                console.error("Error adding greeting:", error);
+                showModal('שגיאה בשליחת הברכה. נסה שוב.');
+            } finally {
+                submitButton.disabled = false;
+                submitButton.textContent = 'הוסף ברכה לקיר';
+            }
+        };
+
+        /**
+         * Handles the submission of a response to a greeting.
+         */
+        const handleResponseSubmit = async (event) => {
+            event.preventDefault();
+            if (!isAuthReady) {
+                showModal('האימות עדיין בתהליך, אנא המתן שניה.');
+                return;
+            }
+
+            const form = event.target;
+            const greetingId = form.getAttribute('data-greeting-id');
+            const responseText = form.elements.responseText.value.trim();
+            const submitButton = form.querySelector('button[type="submit"]');
+
+            if (!responseText) return;
+
+            submitButton.disabled = true;
+            const originalText = submitButton.textContent;
+            submitButton.textContent = '...';
+
+            try {
+                const greetingRef = doc(getGreetingsCollectionRef(), greetingId);
+                
+                const newResponse = {
+                    userId: userId,
+                    text: responseText,
+                    timestamp: new Date().toISOString()
+                };
+
+                // Atomically update the document by adding the new response to the array
+                await updateDoc(greetingRef, {
+                    responses: arrayUnion(newResponse)
+                });
+                
+                form.reset();
+            } catch (error) {
+                console.error("Error adding response:", error);
+                showModal('שגיאה בשליחת התגובה. נסה שוב.');
+            } finally {
+                submitButton.disabled = false;
+                submitButton.textContent = originalText;
+            }
+        };
+
+
+        // --- UI LOGIC ---
+
+        window.onload = () => {
+            const generateForm = document.getElementById('generate-greeting-form');
+            generateForm.addEventListener('submit', handleGenerateGreeting);
+
+            const dreamForm = document.getElementById('dream-machine-form');
+            dreamForm.addEventListener('submit', handleDreamMachine);
+            
+            const songForm = document.getElementById('generate-song-form');
+            songForm.addEventListener('submit', handleGenerateSong);
+            
+            // NEW: Time Machine Event Listener
+            const timeMachineForm = document.getElementById('time-machine-form');
+            timeMachineForm.addEventListener('submit', handleTimeMachine);
+
+
+            // Initial tab setup
+            window.changeTab('generator');
+        };
+
+        window.changeTab = (tabId) => {
+            // Hide all contents and deactivate all buttons
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.tab-button').forEach(el => el.classList.remove('active'));
+
+            // Show the selected content and activate the button
+            document.getElementById(`${tabId}-content`).classList.remove('hidden');
+            document.getElementById(`${tabId}-button`).classList.add('active');
+        };
+
+        /**
+         * Handles the form submission for AI greeting generation.
+         */
+        const handleGenerateGreeting = async (event) => {
+            event.preventDefault();
+            
+            const form = event.target;
+            const recipient = form.elements.recipient.value.trim();
+            const occasion = form.elements.occasion.value.trim();
+            const tone = form.elements.tone.value.trim();
+            const sender = form.elements.senderName.value.trim(); 
+            const outputArea = document.getElementById('greeting-output');
+            const submitButton = form.querySelector('button[type="submit"]');
+
+            if (!recipient || !occasion || !tone) {
+                outputArea.innerHTML = '<p class="text-red-500">נא למלא את כל השדות חוץ משם השולח (שאותו אפשר להשאיר ריק).</p>';
+                return;
+            }
+
+            outputArea.innerHTML = `<div class="loading-ring my-8"></div><p class="text-center text-gray-600 mt-4">ה-AI כותב את הברכה...</p>`;
+            submitButton.disabled = true;
+
+            const prompt = `כתוב ברכה לאדם בשם: ${recipient}, לרגל האירוע: ${occasion}. הטון הרצוי הוא: ${tone}.`;
+
+            try {
+                const greetingText = await generateAiGreeting(prompt);
+                
+                // Append sender name to the generated text for display and posting
+                const finalGreetingText = sender 
+                    ? `${greetingText}\n\nבאהבה רבה,\n${sender}` 
+                    : greetingText;
+                
+                // Create a dynamic title for posting to the wall
+                const postTitle = sender 
+                    ? `ברכה חגיגית מ-${sender} ליאיר (${occasion})` 
+                    : `ברכה ליאיר (${occasion})`;
+
+                outputArea.innerHTML = `<div class="card bg-gray-50 border border-gray-200 p-6 ai-output text-right">${finalGreetingText}</div>
+                                        <button onclick="copyToClipboard(document.querySelector('#greeting-output .ai-output').innerText)" 
+                                            class="mt-4 bg-green-500 text-white p-2 rounded-lg hover:bg-green-600 transition duration-150 w-full md:w-auto">העתק ברכה</button>`;
+                
+                // Set the generated text into the "Post to Wall" section for easy sharing
+                document.getElementById('post-title').value = postTitle; 
+                document.getElementById('post-content').value = finalGreetingText;
+
+            } catch (error) {
+                outputArea.innerHTML = `<p class="text-red-500 mt-4">שגיאה: לא ניתן היה ליצור את הברכה. אנא בדוק את החיבור שלך.</p>`;
+            } finally {
+                submitButton.disabled = false;
+            }
+        };
+
+        /**
+         * Handles the form submission for AI song generation.
+         */
+        const handleGenerateSong = async (event) => {
+            event.preventDefault();
+            
+            const form = event.target;
+            const keywords = form.elements.songKeywords.value.trim();
+            const sender = form.elements.senderName.value.trim();
+            const outputArea = document.getElementById('song-output');
+            const submitButton = form.querySelector('button[type="submit"]');
+
+            if (!keywords) {
+                outputArea.innerHTML = '<p class="text-red-500">נא לספק מילות מפתח או זיכרונות.</p>';
+                return;
+            }
+
+            outputArea.innerHTML = `<div class="loading-ring my-8"></div><p class="text-center text-gray-600 mt-4">ה-AI כותב את השיר ליאיר...</p>`;
+            submitButton.disabled = true;
+
+            try {
+                const songLyrics = await generateAiSong(keywords);
+                
+                // Append sender name to the generated text for display and posting
+                const finalSongText = sender 
+                    ? `${songLyrics}\n\nמוקדש באהבה מ-${sender}.` 
+                    : songLyrics;
+                
+                // Create a dynamic title for posting to the wall
+                const postTitle = sender 
+                    ? `שיר אישי ליאיר מ-${sender}!` 
+                    : `שיר אישי ליאיר!`;
+
+
+                outputArea.innerHTML = `<div class="card bg-yellow-50 border border-yellow-200 p-6 ai-output">${finalSongText}</div>
+                                        <button onclick="copyToClipboard(document.querySelector('#song-output .ai-output').innerText)" 
+                                            class="mt-4 bg-green-500 text-white p-2 rounded-lg hover:bg-green-600 transition duration-150 w-full md:w-auto">העתק שיר</button>`;
+                
+                // Optional: Pre-fill post to wall section
+                document.getElementById('post-title').value = postTitle;
+                document.getElementById('post-content').value = finalSongText;
+
+
+            } catch (error) {
+                outputArea.innerHTML = `<p class="text-red-500 mt-4">שגיאה: לא ניתן היה ליצור את השיר. אנא נסה שוב מאוחר יותר.</p>`;
+            } finally {
+                submitButton.disabled = false;
+            }
+        };
+        
+        /**
+         * Handles the form submission for Time Machine (Prophecy Generation).
+         */
+        const handleTimeMachine = async (event) => {
+            event.preventDefault();
+            
+            const form = event.target;
+            const details = form.elements.timeMachineDetails.value.trim();
+            const outputArea = document.getElementById('prophecy-output');
+            const submitButton = form.querySelector('button[type="submit"]');
+
+            if (!details) {
+                outputArea.innerHTML = '<p class="text-red-500">נא לתאר את הפרטים והשאיפות הנוכחיות של יאיר.</p>';
+                return;
+            }
+
+            outputArea.innerHTML = `<div class="loading-ring my-8"></div><p class="text-center text-gray-600 mt-4">🔮 מכונת הזמן טוענת את החזון של יאיר בן ה-39...</p>`;
+            submitButton.disabled = true;
+
+            try {
+                const prophecyText = await generateTimeMachineProphecy(details);
+                
+                const finalProphecyText = `--- נבואה ליום הולדת 39 ---\n\n${prophecyText}\n\n--- המסע רק החל ---`;
+                
+                const postTitle = `🔮 נבואת העתיד: יאיר בן ה-39`;
+
+                outputArea.innerHTML = `<div class="card bg-indigo-50 border border-indigo-200 p-6 ai-output text-right font-serif text-lg">${finalProphecyText}</div>
+                                        <button onclick="copyToClipboard(document.querySelector('#prophecy-output .ai-output').innerText)" 
+                                            class="mt-4 bg-green-500 text-white p-2 rounded-lg hover:bg-green-600 transition duration-150 w-full md:w-auto">העתק נבואה</button>`;
+                
+                // Optional: Pre-fill post to wall section
+                document.getElementById('post-title').value = postTitle;
+                document.getElementById('post-content').value = finalProphecyText;
+
+
+            } catch (error) {
+                outputArea.innerHTML = `<p class="text-red-500 mt-4">שגיאה: לא ניתן היה לחזות את העתיד. אנא נסה שוב.</p>`;
+            } finally {
+                submitButton.disabled = false;
+            }
+        };
+
+
+        /**
+         * Handles the form submission for Dream Machine (Image Generation).
+         */
+        const handleDreamMachine = async (event) => {
+            event.preventDefault();
+            
+            const form = event.target;
+            const memoryPrompt = form.elements.memoryPrompt.value.trim();
+            const outputArea = document.getElementById('dream-output');
+            const submitButton = form.querySelector('button[type="submit"]');
+
+            if (!memoryPrompt) {
+                outputArea.innerHTML = '<p class="text-red-500">נא לתאר את הזיכרון או החלום שלך.</p>';
+                return;
+            }
+
+            outputArea.innerHTML = `<div class="loading-ring my-8"></div><p class="text-center text-gray-600 mt-4">מכונת החלומות יוצרת את התמונה...</p>`;
+            submitButton.disabled = true;
+
+            try {
+                const imageUrl = await generateAiImage(memoryPrompt);
+
+                if (imageUrl) {
+                    outputArea.innerHTML = `
+                        <img src="${imageUrl}" alt="תמונה שנוצרה מזיכרון: ${memoryPrompt}" 
+                            class="rounded-xl w-full max-w-md mx-auto object-cover border-4 border-white shadow-xl">
+                        <p class="text-center text-gray-600 mt-4 text-sm">יצירת חלום שנוצרה בהצלחה.</p>
+                    `;
+                } else {
+                    outputArea.innerHTML = '<p class="text-red-500 mt-4">שגיאה: לא ניתן היה ליצור תמונה מהזיכרון. נסה לתאר בצורה ברורה יותר.</p>';
+                }
+            } catch (error) {
+                 outputArea.innerHTML = `<p class="text-red-500 mt-4">שגיאה בחיבור למכונת החלומות. נסה שוב מאוחר יותר.</p>`;
+            } finally {
+                submitButton.disabled = false;
+            }
+        };
+
+        /**
+         * Generic function to show a modal message (replaces alert()).
+         */
+        const showModal = (message) => {
+            const modal = document.getElementById('custom-modal');
+            document.getElementById('modal-message').textContent = message;
+            modal.classList.remove('hidden');
+            setTimeout(() => {
+                modal.classList.add('hidden');
+            }, 3000); // Auto-hide after 3 seconds
+        };
+
+        /**
+         * Helper function to copy text to clipboard.
+         */
+        window.copyToClipboard = (text) => {
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            document.body.appendChild(textarea);
+            textarea.select();
+            try {
+                document.execCommand('copy');
+                showModal('הברכה הועתקה ללוח.');
+            } catch (err) {
+                console.error('Could not copy text: ', err);
+                showModal('שגיאה בהעתקה. נסה להעתיק ידנית.');
+            }
+            document.body.removeChild(textarea);
+        };
+    </script>
+</head>
+
+<body class="p-4 md:p-8 min-h-screen">
+    <div class="max-w-4xl mx-auto">
+        <header class="text-center mb-10">
+            <h1 class="text-4xl font-extrabold text-yellow-700 mb-2">🎉 מסיבת הברכות של יאיר 🎉</h1>
+            <p class="text-gray-600 text-lg">יום הולדת שמח! או מזל טוב לבר המצווה! כלי AI ליצירה ושיתוף.</p>
+        </header>
+
+        <!-- User ID Display -->
+        <div id="user-id-display" class="text-center text-xs text-gray-400 mb-6 font-mono break-words">מזהה משתמש: טוען...</div>
+
+        <!-- Tab Navigation -->
+        <nav class="flex justify-around bg-white p-2 rounded-t-xl shadow-md mb-6 border-b-4 border-yellow-300 overflow-x-auto">
+            <button id="generator-button" onclick="changeTab('generator')" class="tab-button text-gray-600 hover:text-yellow-500 px-4 whitespace-nowrap">
+                📝 מחולל ברכות AI
+            </button>
+            <button id="song-button" onclick="changeTab('song')" class="tab-button text-gray-600 hover:text-yellow-500 px-4 whitespace-nowrap">
+                🎶 מחולל שירים
+            </button>
+            <button id="time-machine-button" onclick="changeTab('time-machine')" class="tab-button text-gray-600 hover:text-yellow-500 px-4 whitespace-nowrap">
+                🔮 מכונת הזמן
+            </button>
+            <button id="wall-button" onclick="changeTab('wall')" class="tab-button text-gray-600 hover:text-yellow-500 px-4 whitespace-nowrap">
+                💬 קיר הברכות
+            </button>
+            <button id="dream-button" onclick="changeTab('dream')" class="tab-button text-gray-600 hover:text-yellow-500 px-4 whitespace-nowrap">
+                ✨ מכונת חלומות
+            </button>
+        </nav>
+
+        <!-- Tab Contents -->
+        <div id="app-container" class="bg-white rounded-b-xl p-6 md:p-8 shadow-xl">
+
+            <!-- 1. AI Greeting Generator Content -->
+            <div id="generator-content" class="tab-content hidden">
+                <h2 class="text-2xl font-bold text-yellow-700 mb-6">יצירת ברכה ליאיר באמצעות AI</h2>
+                
+                <form id="generate-greeting-form" class="space-y-4">
+                    <div>
+                        <label for="recipient" class="block text-sm font-medium text-gray-700">למי הברכה מיועדת?</label>
+                        <input type="text" id="recipient" name="recipient" required
+                            class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:ring-yellow-500 focus:border-yellow-500" 
+                            placeholder="דוגמה: יאיר, או אחי היקר יאיר">
+                    </div>
+                    <div>
+                        <label for="occasion" class="block text-sm font-medium text-gray-700">מהי סיבת הברכה?</label>
+                        <input type="text" id="occasion" name="occasion" required
+                            class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:ring-yellow-500 focus:border-yellow-500"
+                            placeholder="דוגמה: בר מצווה, יום הולדת 13, יום הולדת 16">
+                    </div>
+                    <div>
+                        <label for="tone" class="block text-sm font-medium text-gray-700">מה הטון הרצוי?</label>
+                        <input type="text" id="tone" name="tone" required
+                            class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:ring-yellow-500 focus:border-yellow-500"
+                            placeholder="דוגמה: מרגש ומצחיק, רציני ובוגר, מאחל הצלחה בלימודים">
+                    </div>
+                    <div>
+                        <label for="sender" class="block text-sm font-medium text-gray-700">מי שולח את הברכה? (שם)</label>
+                        <input type="text" id="sender" name="senderName"
+                            class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:ring-yellow-500 focus:border-yellow-500" 
+                            placeholder="דוגמה: דודה רותי, או חברך הטוב דני">
+                    </div>
+                    
+                    <button type="submit" class="w-full bg-yellow-600 text-white font-bold py-3 rounded-lg hover:bg-yellow-700 transition duration-150 shadow-md">
+                        צור ברכה חגיגית!
+                    </button>
+                </form>
+
+                <div class="mt-8">
+                    <h3 class="text-xl font-bold mb-3 text-gray-800">תוצאות AI:</h3>
+                    <div id="greeting-output" class="min-h-24 bg-gray-100 p-4 rounded-lg text-gray-700 text-right">
+                        כאן תופיע הברכה שנוצרה.
+                    </div>
+                </div>
+
+                <!-- Section to post the generated greeting to the wall -->
+                <div class="mt-10 pt-6 border-t border-gray-200">
+                    <h3 class="text-xl font-bold mb-4 text-gray-800">פרסום הברכה לקיר הברכות של יאיר</h3>
+                    <form onsubmit="handleNewGreetingSubmit(event)" class="space-y-3">
+                        <input type="text" id="post-title" name="greetingTitle" placeholder="כותרת הברכה (כותרת)" required
+                            class="block w-full rounded-lg border-gray-300 shadow-sm p-3 border">
+                        <textarea id="post-content" name="greetingContent" rows="4" placeholder="תוכן הברכה (ימולא אוטומטית מה-AI)" required
+                            class="block w-full rounded-lg border-gray-300 shadow-sm p-3 border resize-none"></textarea>
+                        <button type="submit" class="w-full bg-indigo-600 text-white font-bold py-3 rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md">
+                            הוסף ברכה לקיר
+                        </button>
+                    </form>
+                </div>
+            </div>
+            
+            <!-- 2. Song Generator Content -->
+            <div id="song-content" class="tab-content hidden">
+                <h2 class="text-2xl font-bold text-yellow-700 mb-6">🎶 מחולל שיר בר מצווה אישי ליאיר</h2>
+                <p class="mb-4 text-gray-600">הכנס/י מילות מפתח, תכונות אופי, או זיכרונות שאת/ה רוצה שיופיעו בשיר. ה-AI יכתוב שיר חרוז ומקפיץ ליאיר!</p>
+                
+                <form id="generate-song-form" class="space-y-4">
+                    <div>
+                        <label for="songKeywords" class="block text-sm font-medium text-gray-700">מילות מפתח (הפרד/י בפסיק):</label>
+                        <textarea id="songKeywords" name="songKeywords" rows="3" required
+                            class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:ring-yellow-500 focus:border-yellow-500 resize-none" 
+                            placeholder="דוגמה: אוהב פיצה, שחקן כדורגל, אח נאמן, חיוך תמיד."></textarea>
+                    </div>
+                    <div>
+                        <label for="songSender" class="block text-sm font-medium text-gray-700">מי שולח את השיר? (שם)</label>
+                        <input type="text" id="songSender" name="senderName"
+                            class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:ring-yellow-500 focus:border-yellow-500" 
+                            placeholder="דוגמה: ההורים האוהבים, או כל המשפחה">
+                    </div>
+                    
+                    <button type="submit" class="w-full bg-orange-500 text-white font-bold py-3 rounded-lg hover:bg-orange-600 transition duration-150 shadow-md">
+                        צור שיר חגיגי אישי!
+                    </button>
+                </form>
+
+                <div class="mt-8">
+                    <h3 class="text-xl font-bold mb-3 text-gray-800">מילות השיר שנוצרו:</h3>
+                    <div id="song-output" class="min-h-32 bg-gray-100 p-4 rounded-lg text-gray-700">
+                        כאן יופיעו מילות השיר.
+                    </div>
+                </div>
+
+                <!-- Section to post the generated song to the wall -->
+                <div class="mt-10 pt-6 border-t border-gray-200">
+                    <h3 class="text-xl font-bold mb-4 text-gray-800">פרסום השיר לקיר הברכות של יאיר</h3>
+                    <form onsubmit="handleNewGreetingSubmit(event)" class="space-y-3">
+                        <input type="text" id="post-title" name="greetingTitle" placeholder="כותרת השיר (ימולא אוטומטית)" required
+                            class="block w-full rounded-lg border-gray-300 shadow-sm p-3 border">
+                        <textarea id="post-content" name="greetingContent" rows="6" placeholder="תוכן השיר (ימולא אוטומטית מה-AI)" required
+                            class="block w-full rounded-lg border-gray-300 shadow-sm p-3 border resize-none"></textarea>
+                        <button type="submit" class="w-full bg-indigo-600 text-white font-bold py-3 rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md">
+                            הוסף שיר לקיר
+                        </button>
+                    </form>
+                </div>
+            </div>
+            
+            <!-- NEW: 3. Time Machine Content -->
+            <div id="time-machine-content" class="tab-content hidden">
+                <h2 class="text-2xl font-bold text-yellow-700 mb-6">🔮 מכונת הזמן: יאיר בן ה-39</h2>
+                <p class="mb-4 text-gray-600">ספר/י על התחביבים, השאיפות והחלומות הנוכחיים של יאיר (או שלנו עבורו!). ה-AI יחזה חזון מרתק ליום הולדתו ה-39.</p>
+                
+                <form id="time-machine-form" class="space-y-4">
+                    <div>
+                        <label for="timeMachineDetails" class="block text-sm font-medium text-gray-700">תכונות, חלומות ושאיפות של יאיר היום:</label>
+                        <textarea id="timeMachineDetails" name="timeMachineDetails" rows="5" required
+                            class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:ring-yellow-500 focus:border-yellow-500 resize-none" 
+                            placeholder="דוגמה: אוהב תכנות, חולם להיות יוטיובר מפורסם, מצחיק מאוד, שואף לטייל בעולם, אוהב חיות."></textarea>
+                    </div>
+                    
+                    <button type="submit" class="w-full bg-purple-600 text-white font-bold py-3 rounded-lg hover:bg-purple-700 transition duration-150 shadow-md">
+                        הרץ סימולציה: יאיר בן 39!
+                    </button>
+                </form>
+
+                <div class="mt-8">
+                    <h3 class="text-xl font-bold mb-3 text-gray-800">חזון העתיד:</h3>
+                    <div id="prophecy-output" class="min-h-32 bg-gray-100 p-4 rounded-lg text-gray-700">
+                        כאן תופיע הנבואה המרגשת.
+                    </div>
+                </div>
+
+                <!-- Section to post the generated prophecy to the wall -->
+                <div class="mt-10 pt-6 border-t border-gray-200">
+                    <h3 class="text-xl font-bold mb-4 text-gray-800">פרסום הנבואה לקיר הברכות של יאיר</h3>
+                    <form onsubmit="handleNewGreetingSubmit(event)" class="space-y-3">
+                        <!-- post-title and post-content are shared with other generators -->
+                        <input type="text" id="post-title" name="greetingTitle" placeholder="כותרת הנבואה (ימולא אוטומטית)" required
+                            class="block w-full rounded-lg border-gray-300 shadow-sm p-3 border">
+                        <textarea id="post-content" name="greetingContent" rows="6" placeholder="תוכן הנבואה (ימולא אוטומטית מה-AI)" required
+                            class="block w-full rounded-lg border-gray-300 shadow-sm p-3 border resize-none"></textarea>
+                        <button type="submit" class="w-full bg-indigo-600 text-white font-bold py-3 rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md">
+                            הוסף נבואה לקיר
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+
+            <!-- 4. Greeting Wall Content -->
+            <div id="wall-content" class="tab-content hidden">
+                <h2 class="text-2xl font-bold text-yellow-700 mb-6">💬 קיר הברכות: מזל טוב ליאיר!</h2>
+                <div id="greetings-list">
+                    <div class="loading-ring my-8"></div>
+                    <p class="text-center text-gray-600 mt-4">טוען ברכות בזמן אמת...</p>
+                </div>
+            </div>
+
+            <!-- 5. Dream Machine Content -->
+            <div id="dream-content" class="tab-content hidden">
+                <h2 class="text-2xl font-bold text-yellow-700 mb-6">✨ מכונת חלומות: זיכרון משותף עם יאיר לתמונה</h2>
+                <p class="mb-4 text-gray-600">תאר/י זיכרון משותף עם יאיר, חלום לעתיד או סצנה מהאירוע. ה-AI יהפוך את התיאור ליצירת אמנות ויזואלית.</p>
+
+                <form id="dream-machine-form" class="space-y-4">
+                    <div>
+                        <label for="memoryPrompt" class="block text-sm font-medium text-gray-700">תיאור הזיכרון/החלום:</label>
+                        <textarea id="memoryPrompt" name="memoryPrompt" rows="4" required
+                            class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:ring-yellow-500 focus:border-yellow-500 resize-none"
+                            placeholder="דוגמה: שני אחים, יאיר ואני, משחקים כדורגל בשדה ירוק בשקיעה, בסגנון ציור נוסטלגי."></textarea>
+                    </div>
+                    
+                    <button type="submit" class="w-full bg-red-600 text-white font-bold py-3 rounded-lg hover:bg-red-700 transition duration-150 shadow-md">
+                        הפעל את מכונת החלומות
+                    </button>
+                </form>
+
+                <div class="mt-8">
+                    <h3 class="text-xl font-bold mb-3 text-gray-800">התמונה שנוצרה:</h3>
+                    <div id="dream-output" class="min-h-72 flex items-center justify-center bg-gray-100 p-4 rounded-lg text-gray-500">
+                        כאן תופיע התמונה שנוצרה על ידי הבינה המלאכותית.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Modal for Messages (Replaces Alert) -->
+    <div id="custom-modal" class="hidden fixed inset-0 z-50 flex items-end justify-center pointer-events-none p-4">
+        <div class="bg-black bg-opacity-70 text-white py-3 px-6 rounded-xl shadow-lg transform transition duration-300 ease-out"
+             role="alert">
+            <span id="modal-message"></span>
+        </div>
+    </div>
+</body>
+</html>
